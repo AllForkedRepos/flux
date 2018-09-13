@@ -1,8 +1,6 @@
 package kubernetes
 
 import (
-	"fmt"
-
 	apiapps "k8s.io/api/apps/v1"
 	apibatch "k8s.io/api/batch/v1beta1"
 	apiv1 "k8s.io/api/core/v1"
@@ -50,6 +48,8 @@ type podController struct {
 	kind        string
 	name        string
 	status      string
+	pods        cluster.Pods
+	errors      []string
 	podTemplate apiv1.PodTemplateSpec
 }
 
@@ -86,6 +86,8 @@ func (pc podController) toClusterController(resourceID flux.ResourceID) cluster.
 	return cluster.Controller{
 		ID:         resourceID,
 		Status:     pc.status,
+		Pods:       pc.pods,
+		Errors:     pc.errors,
 		Antecedent: antecedent,
 		Labels:     pc.GetLabels(),
 		Containers: cluster.ContainersOrExcuse{Containers: clusterContainers, Excuse: excuse},
@@ -120,20 +122,41 @@ func (dk *deploymentKind) getPodControllers(c *Cluster, namespace string) ([]pod
 	return podControllers, nil
 }
 
+func deploymentErrors(d *apiapps.Deployment) []string {
+	var errs []string
+	for _, cond := range d.Status.Conditions {
+		if (cond.Type == apiapps.DeploymentAvailable && cond.Status == apiv1.ConditionFalse) ||
+			(cond.Type == apiapps.DeploymentProgressing && cond.Status == apiv1.ConditionFalse) ||
+			(cond.Type == apiapps.DeploymentReplicaFailure && cond.Status == apiv1.ConditionTrue) {
+			errs = append(errs, cond.Message)
+		}
+	}
+	return errs
+}
+
 func makeDeploymentPodController(deployment *apiapps.Deployment) podController {
 	var status string
 	objectMeta, deploymentStatus := deployment.ObjectMeta, deployment.Status
 
+	status = StatusStarted
+	errs := deploymentErrors(deployment)
+	pods := cluster.Pods{
+		Desired:   *deployment.Spec.Replicas,
+		Updated:   deploymentStatus.UpdatedReplicas,
+		Ready:     deploymentStatus.ReadyReplicas,
+		Available: deploymentStatus.AvailableReplicas,
+		Outdated:  deploymentStatus.Replicas - deploymentStatus.UpdatedReplicas,
+	}
+
 	if deploymentStatus.ObservedGeneration >= objectMeta.Generation {
 		// the definition has been updated; now let's see about the replicas
-		updated, wanted := deploymentStatus.UpdatedReplicas, *deployment.Spec.Replicas
-		if updated == wanted {
-			status = StatusReady
-		} else {
-			status = fmt.Sprintf("%d out of %d updated", updated, wanted)
-		}
-	} else {
 		status = StatusUpdating
+		if pods.Ready == pods.Desired && pods.Available == pods.Desired && pods.Outdated == 0 {
+			status = StatusReady
+		}
+		if len(errs) != 0 {
+			status = StatusError
+		}
 	}
 
 	return podController{
@@ -141,6 +164,8 @@ func makeDeploymentPodController(deployment *apiapps.Deployment) podController {
 		kind:        "Deployment",
 		name:        deployment.ObjectMeta.Name,
 		status:      status,
+		pods:        pods,
+		errors:      errs,
 		podTemplate: deployment.Spec.Template,
 		k8sObject:   deployment}
 }
@@ -166,7 +191,7 @@ func (dk *daemonSetKind) getPodControllers(c *Cluster, namespace string) ([]podC
 	}
 
 	var podControllers []podController
-	for i, _ := range daemonSets.Items {
+	for i := range daemonSets.Items {
 		podControllers = append(podControllers, makeDaemonSetPodController(&daemonSets.Items[i]))
 	}
 
@@ -176,16 +201,22 @@ func (dk *daemonSetKind) getPodControllers(c *Cluster, namespace string) ([]podC
 func makeDaemonSetPodController(daemonSet *apiapps.DaemonSet) podController {
 	var status string
 	objectMeta, daemonSetStatus := daemonSet.ObjectMeta, daemonSet.Status
+
+	status = StatusUpdating
+	pods := cluster.Pods{
+		Desired:   daemonSetStatus.DesiredNumberScheduled,
+		Updated:   daemonSetStatus.UpdatedNumberScheduled,
+		Ready:     daemonSetStatus.NumberReady,
+		Available: daemonSetStatus.NumberAvailable,
+		Outdated:  daemonSetStatus.CurrentNumberScheduled - daemonSetStatus.UpdatedNumberScheduled,
+	}
+
 	if daemonSetStatus.ObservedGeneration >= objectMeta.Generation {
 		// the definition has been updated; now let's see about the replicas
-		updated, wanted := daemonSetStatus.UpdatedNumberScheduled, daemonSetStatus.DesiredNumberScheduled
-		if updated == wanted {
-			status = StatusReady
-		} else {
-			status = fmt.Sprintf("%d out of %d updated", updated, wanted)
-		}
-	} else {
 		status = StatusUpdating
+		if pods.Ready == pods.Desired && pods.Available == pods.Desired && pods.Outdated == 0 {
+			status = StatusReady
+		}
 	}
 
 	return podController{
@@ -193,6 +224,7 @@ func makeDaemonSetPodController(daemonSet *apiapps.DaemonSet) podController {
 		kind:        "DaemonSet",
 		name:        daemonSet.ObjectMeta.Name,
 		status:      status,
+		pods:        pods,
 		podTemplate: daemonSet.Spec.Template,
 		k8sObject:   daemonSet}
 }
@@ -218,7 +250,7 @@ func (dk *statefulSetKind) getPodControllers(c *Cluster, namespace string) ([]po
 	}
 
 	var podControllers []podController
-	for i, _ := range statefulSets.Items {
+	for i := range statefulSets.Items {
 		podControllers = append(podControllers, makeStatefulSetPodController(&statefulSets.Items[i]))
 	}
 
@@ -228,17 +260,22 @@ func (dk *statefulSetKind) getPodControllers(c *Cluster, namespace string) ([]po
 func makeStatefulSetPodController(statefulSet *apiapps.StatefulSet) podController {
 	var status string
 	objectMeta, statefulSetStatus := statefulSet.ObjectMeta, statefulSet.Status
+
+	status = StatusUpdating
+	pods := cluster.Pods{
+		Desired:  *statefulSet.Spec.Replicas,
+		Updated:  statefulSetStatus.UpdatedReplicas,
+		Ready:    statefulSetStatus.ReadyReplicas,
+		Outdated: statefulSetStatus.CurrentReplicas - statefulSetStatus.UpdatedReplicas,
+	}
+
 	// The type of ObservedGeneration is *int64, unlike other controllers.
 	if statefulSetStatus.ObservedGeneration >= objectMeta.Generation {
 		// the definition has been updated; now let's see about the replicas
-		updated, wanted := statefulSetStatus.UpdatedReplicas, *statefulSet.Spec.Replicas
-		if updated == wanted {
-			status = StatusReady
-		} else {
-			status = fmt.Sprintf("%d out of %d updated", updated, wanted)
-		}
-	} else {
 		status = StatusUpdating
+		if pods.Ready == pods.Desired && pods.Updated == pods.Desired && pods.Outdated == 0 {
+			status = StatusReady
+		}
 	}
 
 	return podController{
@@ -246,6 +283,7 @@ func makeStatefulSetPodController(statefulSet *apiapps.StatefulSet) podControlle
 		kind:        "StatefulSet",
 		name:        statefulSet.ObjectMeta.Name,
 		status:      status,
+		pods:        pods,
 		podTemplate: statefulSet.Spec.Template,
 		k8sObject:   statefulSet}
 }
